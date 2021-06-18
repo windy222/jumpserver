@@ -1,126 +1,22 @@
-# ~*~ coding: utf-8 ~*~
-
-from django.utils.translation import ugettext as _
+# -*- coding: utf-8 -*-
+#
+from django.views.generic import TemplateView
 from django.conf import settings
-from django.views.generic import ListView, DetailView, TemplateView
 
-from common.mixins import DatetimeSearchMixin
-from .models import Task, AdHoc, AdHocRunHistory, CeleryTask
-from .hands import AdminUserRequiredMixin
+from common.permissions import IsOrgAdmin, IsOrgAuditor
+from common.mixins.views import PermissionsMixin
 
-
-class TaskListView(AdminUserRequiredMixin, DatetimeSearchMixin, ListView):
-    paginate_by = settings.DISPLAY_PER_PAGE
-    model = Task
-    ordering = ('-date_created',)
-    context_object_name = 'task_list'
-    template_name = 'ops/task_list.html'
-    keyword = ''
-
-    def get_queryset(self):
-        self.queryset = super().get_queryset()
-        self.keyword = self.request.GET.get('keyword', '')
-        self.queryset = self.queryset.filter(
-            date_created__gt=self.date_from,
-            date_created__lt=self.date_to
-        )
-
-        if self.keyword:
-            self.queryset = self.queryset.filter(
-                name__icontains=self.keyword,
-            )
-        return self.queryset
-
-    def get_context_data(self, **kwargs):
-        context = {
-            'app': _('Ops'),
-            'action': _('Task list'),
-            'date_from': self.date_from,
-            'date_to': self.date_to,
-            'keyword': self.keyword,
-        }
-        kwargs.update(context)
-        return super().get_context_data(**kwargs)
+__all__ = ['CeleryTaskLogView']
 
 
-class TaskDetailView(AdminUserRequiredMixin, DetailView):
-    model = Task
-    template_name = 'ops/task_detail.html'
-
-    def get_context_data(self, **kwargs):
-        context = {
-            'app': _('Ops'),
-            'action': _('Task detail'),
-        }
-        kwargs.update(context)
-        return super().get_context_data(**kwargs)
-
-
-class TaskAdhocView(AdminUserRequiredMixin, DetailView):
-    model = Task
-    template_name = 'ops/task_adhoc.html'
-
-    def get_context_data(self, **kwargs):
-        context = {
-            'app': _('Ops'),
-            'action': _('Task versions'),
-        }
-        kwargs.update(context)
-        return super().get_context_data(**kwargs)
-
-
-class TaskHistoryView(AdminUserRequiredMixin, DetailView):
-    model = Task
-    template_name = 'ops/task_history.html'
-
-    def get_context_data(self, **kwargs):
-        context = {
-            'app': _('Ops'),
-            'action': _('Task run history'),
-        }
-        kwargs.update(context)
-        return super().get_context_data(**kwargs)
-
-
-class AdHocDetailView(AdminUserRequiredMixin, DetailView):
-    model = AdHoc
-    template_name = 'ops/adhoc_detail.html'
-
-    def get_context_data(self, **kwargs):
-        context = {
-            'app': _('Ops'),
-            'action': 'Task version detail',
-        }
-        kwargs.update(context)
-        return super().get_context_data(**kwargs)
-
-
-class AdHocHistoryView(AdminUserRequiredMixin, DetailView):
-    model = AdHoc
-    template_name = 'ops/adhoc_history.html'
-
-    def get_context_data(self, **kwargs):
-        context = {
-            'app': _('Ops'),
-            'action': _('Version run history'),
-        }
-        kwargs.update(context)
-        return super().get_context_data(**kwargs)
-
-
-class AdHocHistoryDetailView(AdminUserRequiredMixin, DetailView):
-    model = AdHocRunHistory
-    template_name = 'ops/adhoc_history_detail.html'
-
-    def get_context_data(self, **kwargs):
-        context = {
-            'app': _('Ops'),
-            'action': _('Run history detail'),
-        }
-        kwargs.update(context)
-        return super().get_context_data(**kwargs)
-
-
-class CeleryTaskLogView(AdminUserRequiredMixin, DetailView):
+class CeleryTaskLogView(PermissionsMixin, TemplateView):
     template_name = 'ops/celery_task_log.html'
-    model = CeleryTask
+    permission_classes = [IsOrgAdmin | IsOrgAuditor]
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context.update({
+            'task_id': self.kwargs.get('pk'),
+            'ws_port': settings.WS_LISTEN_PORT
+        })
+        return context

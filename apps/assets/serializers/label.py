@@ -1,18 +1,36 @@
 # -*- coding: utf-8 -*-
 #
 from rest_framework import serializers
-from rest_framework_bulk.serializers import BulkListSerializer
+from django.utils.translation import ugettext_lazy as _
+
+from common.drf.serializers import AdaptedBulkListSerializer
+from orgs.mixins.serializers import BulkOrgResourceModelSerializer
 
 from ..models import Label
 
 
-class LabelSerializer(serializers.ModelSerializer):
-    asset_count = serializers.SerializerMethodField()
+class LabelSerializer(BulkOrgResourceModelSerializer):
+    asset_count = serializers.SerializerMethodField(label=_("Assets amount"))
+    category_display = serializers.ReadOnlyField(source='get_category_display', label=_('Category display'))
 
     class Meta:
         model = Label
-        fields = '__all__'
-        list_serializer_class = BulkListSerializer
+        fields_mini = ['id', 'name']
+        fields_small = fields_mini + [
+            'value', 'category', 'category_display',
+            'is_active',
+            'date_created',
+            'comment',
+        ]
+        fields_m2m = ['asset_count', 'assets']
+        fields = fields_small + fields_m2m
+        read_only_fields = (
+            'category', 'date_created', 'asset_count',
+        )
+        extra_kwargs = {
+            'assets': {'required': False}
+        }
+        list_serializer_class = AdaptedBulkListSerializer
 
     @staticmethod
     def get_asset_count(obj):
@@ -24,7 +42,7 @@ class LabelSerializer(serializers.ModelSerializer):
         return fields
 
 
-class LabelDistinctSerializer(serializers.ModelSerializer):
+class LabelDistinctSerializer(BulkOrgResourceModelSerializer):
     value = serializers.SerializerMethodField()
 
     class Meta:

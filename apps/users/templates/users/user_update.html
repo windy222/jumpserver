@@ -1,8 +1,0 @@
-{% extends 'users/_user.html' %}
-{% load i18n %}
-{% load bootstrap3 %}
-{% block user_template_title %}{% trans "Update user" %}{% endblock %}
-{% block password %}
-    {% bootstrap_field form.password layout="horizontal" %}
-    {% bootstrap_field form.public_key layout="horizontal" %}
-{% endblock %}

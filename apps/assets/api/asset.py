@@ -1,108 +1,142 @@
 # -*- coding: utf-8 -*-
 #
-
-from rest_framework import generics
-from rest_framework.response import Response
-from rest_framework_bulk import BulkModelViewSet
-from rest_framework_bulk import ListBulkCreateUpdateDestroyAPIView
-from rest_framework.pagination import LimitOffsetPagination
+from assets.api import FilterAssetByNodeMixin
+from rest_framework.viewsets import ModelViewSet
+from rest_framework.generics import RetrieveAPIView
 from django.shortcuts import get_object_or_404
-from django.db.models import Q
 
-from common.mixins import IDInFilterMixin
-from common.utils import get_logger
-from ..hands import IsSuperUser, IsValidUser, IsSuperUserOrAppUser
-from ..models import Asset, SystemUser, AdminUser, Node
+from common.utils import get_logger, get_object_or_none
+from common.permissions import IsOrgAdmin, IsOrgAdminOrAppUser, IsSuperUser
+from orgs.mixins.api import OrgBulkModelViewSet
+from orgs.mixins import generics
+from ..models import Asset, Node, Platform
 from .. import serializers
-from ..tasks import update_asset_hardware_info_manual, \
-    test_asset_connectability_manual
-from ..utils import LabelFilter
+from ..tasks import (
+    update_assets_hardware_info_manual, test_assets_connectivity_manual
+)
+from ..filters import FilterAssetByNodeFilterBackend, LabelFilterBackend, IpInFilterBackend
 
 
 logger = get_logger(__file__)
 __all__ = [
-    'AssetViewSet', 'AssetListUpdateApi',
-    'AssetRefreshHardwareApi', 'AssetAdminUserTestApi'
+    'AssetViewSet', 'AssetPlatformRetrieveApi',
+    'AssetGatewayListApi', 'AssetPlatformViewSet',
+    'AssetTaskCreateApi', 'AssetsTaskCreateApi',
 ]
 
 
-class AssetViewSet(IDInFilterMixin, LabelFilter, BulkModelViewSet):
+class AssetViewSet(FilterAssetByNodeMixin, OrgBulkModelViewSet):
     """
     API endpoint that allows Asset to be viewed or edited.
     """
-    filter_fields = ("hostname", "ip")
-    search_fields = filter_fields
+    model = Asset
+    filterset_fields = {
+        'hostname': ['exact'],
+        'ip': ['exact'],
+        'systemuser__id': ['exact'],
+        'admin_user__id': ['exact'],
+        'platform__base': ['exact'],
+        'is_active': ['exact'],
+        'protocols': ['exact', 'icontains']
+    }
+    search_fields = ("hostname", "ip")
     ordering_fields = ("hostname", "ip", "port", "cpu_cores")
-    queryset = Asset.objects.all()
-    serializer_class = serializers.AssetSerializer
-    pagination_class = LimitOffsetPagination
-    permission_classes = (IsSuperUserOrAppUser,)
+    serializer_classes = {
+        'default': serializers.AssetSerializer,
+        'display': serializers.AssetDisplaySerializer,
+    }
+    permission_classes = (IsOrgAdminOrAppUser,)
+    extra_filter_backends = [FilterAssetByNodeFilterBackend, LabelFilterBackend, IpInFilterBackend]
+
+    def set_assets_node(self, assets):
+        if not isinstance(assets, list):
+            assets = [assets]
+        node_id = self.request.query_params.get('node_id')
+        if not node_id:
+            return
+        node = get_object_or_none(Node, pk=node_id)
+        if not node:
+            return
+        node.assets.add(*assets)
+
+    def perform_create(self, serializer):
+        assets = serializer.save()
+        self.set_assets_node(assets)
+
+
+class AssetPlatformRetrieveApi(RetrieveAPIView):
+    queryset = Platform.objects.all()
+    permission_classes = (IsOrgAdminOrAppUser,)
+    serializer_class = serializers.PlatformSerializer
+
+    def get_object(self):
+        asset_pk = self.kwargs.get('pk')
+        asset = get_object_or_404(Asset, pk=asset_pk)
+        return asset.platform
+
+
+class AssetPlatformViewSet(ModelViewSet):
+    queryset = Platform.objects.all()
+    permission_classes = (IsSuperUser,)
+    serializer_class = serializers.PlatformSerializer
+    filterset_fields = ['name', 'base']
+    search_fields = ['name']
+
+    def get_permissions(self):
+        if self.request.method.lower() in ['get', 'options']:
+            self.permission_classes = (IsOrgAdmin,)
+        return super().get_permissions()
+
+    def check_object_permissions(self, request, obj):
+        if request.method.lower() in ['delete', 'put', 'patch'] and obj.internal:
+            self.permission_denied(
+                request, message={"detail": "Internal platform"}
+            )
+        return super().check_object_permissions(request, obj)
+
+
+class AssetsTaskMixin:
+    def perform_assets_task(self, serializer):
+        data = serializer.validated_data
+        assets = data['assets']
+        action = data['action']
+        if action == "refresh":
+            task = update_assets_hardware_info_manual.delay(assets)
+        else:
+            task = test_assets_connectivity_manual.delay(assets)
+        data = getattr(serializer, '_data', {})
+        data["task"] = task.id
+        setattr(serializer, '_data', data)
+
+    def perform_create(self, serializer):
+        self.perform_assets_task(serializer)
+
+
+class AssetTaskCreateApi(AssetsTaskMixin, generics.CreateAPIView):
+    model = Asset
+    serializer_class = serializers.AssetTaskSerializer
+    permission_classes = (IsOrgAdmin,)
+
+    def create(self, request, *args, **kwargs):
+        pk = self.kwargs.get('pk')
+        request.data['assets'] = [pk]
+        return super().create(request, *args, **kwargs)
+
+
+class AssetsTaskCreateApi(AssetsTaskMixin, generics.CreateAPIView):
+    model = Asset
+    serializer_class = serializers.AssetTaskSerializer
+    permission_classes = (IsOrgAdmin,)
+
+
+class AssetGatewayListApi(generics.ListAPIView):
+    permission_classes = (IsOrgAdminOrAppUser,)
+    serializer_class = serializers.GatewayWithAuthSerializer
 
     def get_queryset(self):
-        queryset = super().get_queryset()\
-            .prefetch_related('labels', 'nodes')\
-            .select_related('admin_user')
-        admin_user_id = self.request.query_params.get('admin_user_id')
-        node_id = self.request.query_params.get("node_id")
-        show_current_asset = self.request.query_params.get("show_current_asset")
-
-        if admin_user_id:
-            admin_user = get_object_or_404(AdminUser, id=admin_user_id)
-            queryset = queryset.filter(admin_user=admin_user)
-
-        if node_id and show_current_asset:
-            node = get_object_or_404(Node, id=node_id)
-            if node.is_root():
-                queryset = queryset.filter(
-                    Q(nodes=node_id) | Q(nodes__isnull=True)
-                ).distinct()
-            else:
-                queryset = queryset.filter(nodes=node).distinct()
-
-        if node_id and not show_current_asset:
-            node = get_object_or_404(Node, id=node_id)
-            if node.is_root():
-                queryset = Asset.objects.all()
-            else:
-                queryset = queryset.filter(
-                    nodes__key__regex='^{}(:[0-9]+)*$'.format(node.key),
-                ).distinct()
+        asset_id = self.kwargs.get('pk')
+        asset = get_object_or_404(Asset, pk=asset_id)
+        if not asset.domain:
+            return []
+        queryset = asset.domain.gateways.filter(protocol='ssh')
         return queryset
-
-
-class AssetListUpdateApi(IDInFilterMixin, ListBulkCreateUpdateDestroyAPIView):
-    """
-    Asset bulk update api
-    """
-    queryset = Asset.objects.all()
-    serializer_class = serializers.AssetSerializer
-    permission_classes = (IsSuperUser,)
-
-
-class AssetRefreshHardwareApi(generics.RetrieveAPIView):
-    """
-    Refresh asset hardware info
-    """
-    queryset = Asset.objects.all()
-    serializer_class = serializers.AssetSerializer
-    permission_classes = (IsSuperUser,)
-
-    def retrieve(self, request, *args, **kwargs):
-        asset_id = kwargs.get('pk')
-        asset = get_object_or_404(Asset, pk=asset_id)
-        task = update_asset_hardware_info_manual.delay(asset)
-        return Response({"task": task.id})
-
-
-class AssetAdminUserTestApi(generics.RetrieveAPIView):
-    """
-    Test asset admin user connectivity
-    """
-    queryset = Asset.objects.all()
-    permission_classes = (IsSuperUser,)
-
-    def retrieve(self, request, *args, **kwargs):
-        asset_id = kwargs.get('pk')
-        asset = get_object_or_404(Asset, pk=asset_id)
-        task = test_asset_connectability_manual.delay(asset)
-        return Response({"task": task.id})

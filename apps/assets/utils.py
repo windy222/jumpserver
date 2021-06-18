@@ -1,83 +1,139 @@
 # ~*~ coding: utf-8 ~*~
 #
-import os
-import paramiko
-from paramiko.ssh_exception import SSHException
+from collections import defaultdict
+from common.utils import get_logger, dict_get_any, is_uuid, get_object_or_none, timeit
+from common.http import is_true
+from common.struct import Stack
+from common.db.models import output_as_string
+from orgs.utils import ensure_in_real_or_default_org, current_org
 
-from common.utils import get_object_or_none
-from .models import Asset, SystemUser, Label
+from .locks import NodeTreeUpdateLock
+from .models import Node, Asset
 
-
-def get_assets_by_id_list(id_list):
-    return Asset.objects.filter(id__in=id_list)
-
-
-def get_assets_by_hostname_list(hostname_list):
-    return Asset.objects.filter(hostname__in=hostname_list)
+logger = get_logger(__file__)
 
 
-def get_system_user_by_name(name):
-    system_user = get_object_or_none(SystemUser, name=name)
-    return system_user
+@NodeTreeUpdateLock()
+@ensure_in_real_or_default_org
+def check_node_assets_amount():
+    logger.info(f'Check node assets amount {current_org}')
+    nodes = list(Node.objects.all().only('id', 'key', 'assets_amount'))
+    nodeid_assetid_pairs = list(Asset.nodes.through.objects.all().values_list('node_id', 'asset_id'))
+
+    nodekey_assetids_mapper = defaultdict(set)
+    nodeid_nodekey_mapper = {}
+    for node in nodes:
+        nodeid_nodekey_mapper[node.id] = node.key
+
+    for nodeid, assetid in nodeid_assetid_pairs:
+        if nodeid not in nodeid_nodekey_mapper:
+            continue
+        nodekey = nodeid_nodekey_mapper[nodeid]
+        nodekey_assetids_mapper[nodekey].add(assetid)
+
+    util = NodeAssetsUtil(nodes, nodekey_assetids_mapper)
+    util.generate()
+
+    to_updates = []
+    for node in nodes:
+        assets_amount = util.get_assets_amount(node.key)
+        if node.assets_amount != assets_amount:
+            logger.error(f'Node[{node.key}] assets amount error {node.assets_amount} != {assets_amount}')
+            node.assets_amount = assets_amount
+            to_updates.append(node)
+    Node.objects.bulk_update(to_updates, fields=('assets_amount',))
 
 
-class LabelFilter:
-    def filter_queryset(self, queryset):
-        queryset = super().filter_queryset(queryset)
-        query_keys = self.request.query_params.keys()
-        all_label_keys = Label.objects.values_list('name', flat=True)
-        valid_keys = set(all_label_keys) & set(query_keys)
-        labels_query = {}
-        for key in valid_keys:
-            labels_query[key] = self.request.query_params.get(key)
-
-        conditions = []
-        for k, v in labels_query.items():
-            query = {'labels__name': k, 'labels__value': v}
-            conditions.append(query)
-
-        if conditions:
-            for kwargs in conditions:
-                queryset = queryset.filter(**kwargs)
-        return queryset
+def is_query_node_all_assets(request):
+    request = request
+    query_all_arg = request.query_params.get('all', 'true')
+    show_current_asset_arg = request.query_params.get('show_current_asset')
+    if show_current_asset_arg is not None:
+        return not is_true(show_current_asset_arg)
+    return is_true(query_all_arg)
 
 
-def test_gateway_connectability(gateway):
-    """
-    Test system cant connect his assets or not.
-    :param gateway:
-    :return:
-    """
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    proxy = paramiko.SSHClient()
-    proxy.load_host_keys(os.path.expanduser('~/.ssh/known_hosts'))
-    proxy.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+def get_node(request):
+    node_id = dict_get_any(request.query_params, ['node', 'node_id'])
+    if not node_id:
+        return None
 
-    try:
-        proxy.connect(gateway.ip, username=gateway.username,
-                      password=gateway.password,
-                      pkey=gateway.private_key_obj)
-    except(paramiko.AuthenticationException,
-           paramiko.BadAuthenticationType,
-           SSHException) as e:
-        return False, str(e)
+    if is_uuid(node_id):
+        node = get_object_or_none(Node, id=node_id)
+    else:
+        node = get_object_or_none(Node, key=node_id)
+    return node
 
-    sock = proxy.get_transport().open_channel(
-        'direct-tcpip', ('127.0.0.1', gateway.port), ('127.0.0.1', 0)
-    )
 
-    try:
-        client.connect("127.0.0.1", port=gateway.port,
-                       username=gateway.username,
-                       password=gateway.password,
-                       key_filename=gateway.private_key_file,
-                       sock=sock,
-                       timeout=5
-                       )
-    except (paramiko.SSHException, paramiko.ssh_exception.SSHException,
-            paramiko.AuthenticationException, TimeoutError) as e:
-        return False, str(e)
-    finally:
-        client.close()
-    return True, None
+class NodeAssetsInfo:
+    __slots__ = ('key', 'assets_amount', 'assets')
+
+    def __init__(self, key, assets_amount, assets):
+        self.key = key
+        self.assets_amount = assets_amount
+        self.assets = assets
+
+    def __str__(self):
+        return self.key
+
+
+class NodeAssetsUtil:
+    def __init__(self, nodes, nodekey_assetsid_mapper):
+        """
+        :param nodes: 节点
+        :param nodekey_assetsid_mapper:  节点直接资产id的映射 {"key1": set(), "key2": set()}
+        """
+        self.nodes = nodes
+        # node_id --> set(asset_id1, asset_id2)
+        self.nodekey_assetsid_mapper = nodekey_assetsid_mapper
+        self.nodekey_assetsinfo_mapper = {}
+
+    @timeit
+    def generate(self):
+        # 准备排序好的资产信息数据
+        infos = []
+        for node in self.nodes:
+            assets = self.nodekey_assetsid_mapper.get(node.key, set())
+            info = NodeAssetsInfo(key=node.key, assets_amount=0, assets=assets)
+            infos.append(info)
+        infos = sorted(infos, key=lambda i: [int(i) for i in i.key.split(':')])
+        # 这个守卫需要添加一下，避免最后一个无法出栈
+        guarder = NodeAssetsInfo(key='', assets_amount=0, assets=set())
+        infos.append(guarder)
+
+        stack = Stack()
+        for info in infos:
+            # 如果栈顶的不是这个节点的父祖节点，那么可以出栈了，可以计算资产数量了
+            while stack.top and not info.key.startswith(f'{stack.top.key}:'):
+                pop_info = stack.pop()
+                pop_info.assets_amount = len(pop_info.assets)
+                self.nodekey_assetsinfo_mapper[pop_info.key] = pop_info
+                if not stack.top:
+                    continue
+                stack.top.assets.update(pop_info.assets)
+            stack.push(info)
+
+    def get_assets_by_key(self, key):
+        info = self.nodekey_assetsinfo_mapper[key]
+        return info['assets']
+
+    def get_assets_amount(self, key):
+        info = self.nodekey_assetsinfo_mapper[key]
+        return info.assets_amount
+
+    @classmethod
+    def test_it(cls):
+        from assets.models import Node, Asset
+
+        nodes = list(Node.objects.all())
+        nodes_assets = Asset.nodes.through.objects.all()\
+            .annotate(aid=output_as_string('asset_id'))\
+            .values_list('node__key', 'aid')
+
+        mapping = defaultdict(set)
+        for key, asset_id in nodes_assets:
+            mapping[key].add(asset_id)
+
+        util = cls(nodes, mapping)
+        util.generate()
+        return util

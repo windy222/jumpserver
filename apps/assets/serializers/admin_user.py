@@ -1,49 +1,43 @@
 # -*- coding: utf-8 -*-
 #
-from django.core.cache import cache
+from django.utils.translation import ugettext_lazy as _
 from rest_framework import serializers
 
 from ..models import Node, AdminUser
-from ..const import ADMIN_USER_CONN_CACHE_KEY
+from orgs.mixins.serializers import BulkOrgResourceModelSerializer
 
-from .base import AuthSerializer
+from .base import AuthSerializer, AuthSerializerMixin
 
 
-class AdminUserSerializer(serializers.ModelSerializer):
+class AdminUserSerializer(AuthSerializerMixin, BulkOrgResourceModelSerializer):
     """
     管理用户
     """
-    assets_amount = serializers.SerializerMethodField()
-    unreachable_amount = serializers.SerializerMethodField()
-    reachable_amount = serializers.SerializerMethodField()
 
     class Meta:
         model = AdminUser
-        fields = '__all__'
+        fields_mini  = ['id', 'name', 'username']
+        fields_write_only = ['password', 'private_key', 'public_key']
+        fields_small = fields_mini + fields_write_only + [
+            'date_created', 'date_updated',
+            'comment', 'created_by'
+        ]
+        fields_fk = ['assets_amount']
+        fields = fields_small + fields_fk
+        read_only_fields = ['date_created', 'date_updated', 'created_by', 'assets_amount']
 
-    def get_field_names(self, declared_fields, info):
-        fields = super().get_field_names(declared_fields, info)
-        return [f for f in fields if not f.startswith('_')]
+        extra_kwargs = {
+            'username': {"required": True},
+            'password': {"write_only": True},
+            'private_key': {"write_only": True},
+            'public_key': {"write_only": True},
+            'assets_amount': {'label': _('Asset')},
+        }
 
-    @staticmethod
-    def get_unreachable_amount(obj):
-        data = cache.get(ADMIN_USER_CONN_CACHE_KEY.format(obj.name))
-        if data:
-            return len(data.get('dark'))
-        else:
-            return 0
 
-    @staticmethod
-    def get_reachable_amount(obj):
-        data = cache.get(ADMIN_USER_CONN_CACHE_KEY.format(obj.name))
-        if data:
-            return len(data.get('contacted'))
-        else:
-            return 0
-
-    @staticmethod
-    def get_assets_amount(obj):
-        return obj.assets_amount
+class AdminUserDetailSerializer(AdminUserSerializer):
+    class Meta(AdminUserSerializer.Meta):
+        fields = AdminUserSerializer.Meta.fields + ['ssh_key_fingerprint']
 
 
 class AdminUserAuthSerializer(AuthSerializer):
@@ -58,7 +52,7 @@ class ReplaceNodeAdminUserSerializer(serializers.ModelSerializer):
     管理用户更新关联到的集群
     """
     nodes = serializers.PrimaryKeyRelatedField(
-        many=True, queryset=Node.objects.all()
+        many=True, queryset=Node.objects
     )
 
     class Meta:
@@ -66,4 +60,13 @@ class ReplaceNodeAdminUserSerializer(serializers.ModelSerializer):
         fields = ['id', 'nodes']
 
 
+class TaskIDSerializer(serializers.Serializer):
+    task = serializers.CharField(read_only=True)
 
+
+class AssetUserTaskSerializer(serializers.Serializer):
+    ACTION_CHOICES = (
+        ('test', 'test'),
+    )
+    action = serializers.ChoiceField(choices=ACTION_CHOICES, write_only=True)
+    task = serializers.CharField(read_only=True)

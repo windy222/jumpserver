@@ -1,124 +1,40 @@
+#
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import never_cache
+from django.http import HttpResponse
+from django.views.generic.base import TemplateView
 
-from django.core.cache import cache
-from django.views.generic import TemplateView, View, DetailView
-from django.shortcuts import render, redirect, Http404, reverse
-from django.contrib import messages
-from django.utils.translation import ugettext as _
-from django.conf import settings
-
-from .forms import EmailSettingForm, LDAPSettingForm, BasicSettingForm, \
-    TerminalSettingForm
-from .mixins import AdminUserRequiredMixin
-from .signals import ldap_auth_enable
+from common.utils import bulk_get, FlashMessageUtil
 
 
-class BasicSettingView(AdminUserRequiredMixin, TemplateView):
-    form_class = BasicSettingForm
-    template_name = "common/basic_setting.html"
+@method_decorator(never_cache, name='dispatch')
+class FlashMessageMsgView(TemplateView):
+    template_name = 'flash_message_standalone.html'
 
-    def get_context_data(self, **kwargs):
+    def get(self, request, *args, **kwargs):
+        code = request.GET.get('code')
+        if not code:
+            return HttpResponse('Not found the code')
+
+        message_data = FlashMessageUtil.get_message_by_code(code)
+        if not message_data:
+            return HttpResponse('Message code error')
+
+        title, message, redirect_url, confirm_button, cancel_url = bulk_get(
+            message_data, 'title', 'message', 'redirect_url', 'confirm_button', 'cancel_url'
+        )
+
+        interval = message_data.get('interval', 3)
+        auto_redirect = message_data.get('auto_redirect', True)
+        has_cancel = message_data.get('has_cancel', False)
         context = {
-            'app': _('Settings'),
-            'action': _('Basic setting'),
-            'form': self.form_class(),
+            'title': title,
+            'messages': message,
+            'interval': interval,
+            'redirect_url': redirect_url,
+            'auto_redirect': auto_redirect,
+            'confirm_button': confirm_button,
+            'has_cancel': has_cancel,
+            'cancel_url': cancel_url,
         }
-        kwargs.update(context)
-        return super().get_context_data(**kwargs)
-
-    def post(self, request):
-        form = self.form_class(request.POST)
-        if form.is_valid():
-            form.save()
-            msg = _("Update setting successfully, please restart program")
-            messages.success(request, msg)
-            return redirect('settings:basic-setting')
-        else:
-            context = self.get_context_data()
-            context.update({"form": form})
-            return render(request, self.template_name, context)
-
-
-class EmailSettingView(AdminUserRequiredMixin, TemplateView):
-    form_class = EmailSettingForm
-    template_name = "common/email_setting.html"
-
-    def get_context_data(self, **kwargs):
-        context = {
-            'app': _('Settings'),
-            'action': _('Email setting'),
-            'form': self.form_class(),
-        }
-        kwargs.update(context)
-        return super().get_context_data(**kwargs)
-
-    def post(self, request):
-        form = self.form_class(request.POST)
-        if form.is_valid():
-            form.save()
-            msg = _("Update setting successfully, please restart program")
-            messages.success(request, msg)
-            return redirect('settings:email-setting')
-        else:
-            context = self.get_context_data()
-            context.update({"form": form})
-            return render(request, self.template_name, context)
-
-
-class LDAPSettingView(AdminUserRequiredMixin, TemplateView):
-    form_class = LDAPSettingForm
-    template_name = "common/ldap_setting.html"
-
-    def get_context_data(self, **kwargs):
-        context = {
-            'app': _('Settings'),
-            'action': _('LDAP setting'),
-            'form': self.form_class(),
-        }
-        kwargs.update(context)
-        return super().get_context_data(**kwargs)
-
-    def post(self, request):
-        form = self.form_class(request.POST)
-        if form.is_valid():
-            form.save()
-            if "AUTH_LDAP" in form.cleaned_data:
-                ldap_auth_enable.send(form.cleaned_data["AUTH_LDAP"])
-            msg = _("Update setting successfully, please restart program")
-            messages.success(request, msg)
-            return redirect('settings:ldap-setting')
-        else:
-            context = self.get_context_data()
-            context.update({"form": form})
-            return render(request, self.template_name, context)
-
-
-class TerminalSettingView(AdminUserRequiredMixin, TemplateView):
-    form_class = TerminalSettingForm
-    template_name = "common/terminal_setting.html"
-
-    def get_context_data(self, **kwargs):
-        command_storage = settings.TERMINAL_COMMAND_STORAGE
-        replay_storage = settings.TERMINAL_REPLAY_STORAGE
-        context = {
-            'app': _('Settings'),
-            'action': _('Terminal setting'),
-            'form': self.form_class(),
-            'replay_storage': replay_storage,
-            'command_storage': command_storage,
-        }
-        kwargs.update(context)
-        return super().get_context_data(**kwargs)
-
-    def post(self, request):
-        form = self.form_class(request.POST)
-        if form.is_valid():
-            form.save()
-            msg = _("Update setting successfully, please restart program")
-            messages.success(request, msg)
-            return redirect('settings:terminal-setting')
-        else:
-            context = self.get_context_data()
-            context.update({"form": form})
-            return render(request, self.template_name, context)
-
-
+        return self.render_to_response(context)

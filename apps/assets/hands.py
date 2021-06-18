@@ -6,11 +6,10 @@
 
     Other module of this app shouldn't connect with other app.
 
-    :copyright: (c) 2014-2018 by Jumpserver Team.
+    :copyright: (c) 2014-2018 by JumpServer Team.
     :license: GPL v2, see LICENSE for more details.
 """
 
 
-from common.mixins import AdminUserRequiredMixin
-from common.permissions import IsAppUser, IsSuperUser, IsValidUser, IsSuperUserOrAppUser
+from common.permissions import IsAppUser, IsOrgAdmin, IsValidUser, IsOrgAdminOrAppUser
 from users.models import User, UserGroup

@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from rest_framework_bulk import BulkModelViewSet
 from django.db.models import Count
 
 from common.utils import get_logger
-from ..hands import IsSuperUser
+from orgs.mixins.api import OrgBulkModelViewSet
+from ..hands import IsOrgAdmin
 from ..models import Label
 from .. import serializers
 
@@ -26,9 +26,11 @@ logger = get_logger(__file__)
 __all__ = ['LabelViewSet']
 
 
-class LabelViewSet(BulkModelViewSet):
-    queryset = Label.objects.annotate(asset_count=Count("assets"))
-    permission_classes = (IsSuperUser,)
+class LabelViewSet(OrgBulkModelViewSet):
+    model = Label
+    filterset_fields = ("name", "value")
+    search_fields = filterset_fields
+    permission_classes = (IsOrgAdmin,)
     serializer_class = serializers.LabelSerializer
 
     def list(self, request, *args, **kwargs):
@@ -36,3 +38,7 @@ class LabelViewSet(BulkModelViewSet):
             self.serializer_class = serializers.LabelDistinctSerializer
             self.queryset = self.queryset.values("name").distinct()
         return super().list(request, *args, **kwargs)
+
+    def get_queryset(self):
+        self.queryset = Label.objects.annotate(asset_count=Count("assets"))
+        return self.queryset

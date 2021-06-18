@@ -1,92 +1,111 @@
 # -*- coding: utf-8 -*-
 #
-import json
+import os
+import uuid
 
-from rest_framework.views import Response, APIView
-from ldap3 import Server, Connection
-from django.core.mail import get_connection, send_mail
-from django.utils.translation import ugettext_lazy as _
-from django.conf import settings
+from django.core.cache import cache
+from django.views.decorators.csrf import csrf_exempt
 
-from .permissions import IsSuperUser
-from .serializers import MailTestSerializer, LDAPTestSerializer
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import generics, serializers
+from rest_framework.viewsets import GenericViewSet
 
+from common.permissions import IsValidUser
+from .http import HttpResponseTemporaryRedirect
+from .const import KEY_CACHE_RESOURCE_IDS
+from .utils import get_logger
+from .mixins import CommonApiMixin
 
-class MailTestingAPI(APIView):
-    permission_classes = (IsSuperUser,)
-    serializer_class = MailTestSerializer
-    success_message = _("Test mail sent to {}, please check")
+__all__ = [
+    'LogTailApi', 'ResourcesIDCacheApi', 'CommonGenericViewSet'
+]
 
-    def post(self, request):
-        serializer = self.serializer_class(data=request.data)
-        if serializer.is_valid():
-            email_host_user = serializer.validated_data["EMAIL_HOST_USER"]
-            for k, v in serializer.validated_data.items():
-                if k.startswith('EMAIL'):
-                    setattr(settings, k, v)
-            try:
-                subject = "Test"
-                message = "Test smtp setting"
-                send_mail(subject, message,  email_host_user, [email_host_user])
-            except Exception as e:
-                return Response({"error": str(e)}, status=401)
-
-            return Response({"msg": self.success_message.format(email_host_user)})
-        else:
-            return Response({"error": str(serializer.errors)}, status=401)
+logger = get_logger(__file__)
 
 
-class LDAPTestingAPI(APIView):
-    permission_classes = (IsSuperUser,)
-    serializer_class = LDAPTestSerializer
-    success_message = _("Test ldap success")
-
-    def post(self, request):
-        serializer = self.serializer_class(data=request.data)
-        if serializer.is_valid():
-            host = serializer.validated_data["AUTH_LDAP_SERVER_URI"]
-            bind_dn = serializer.validated_data["AUTH_LDAP_BIND_DN"]
-            password = serializer.validated_data["AUTH_LDAP_BIND_PASSWORD"]
-            use_ssl = serializer.validated_data.get("AUTH_LDAP_START_TLS", False)
-            search_ou = serializer.validated_data["AUTH_LDAP_SEARCH_OU"]
-            search_filter = serializer.validated_data["AUTH_LDAP_SEARCH_FILTER"]
-            attr_map = serializer.validated_data["AUTH_LDAP_USER_ATTR_MAP"]
-
-            try:
-                attr_map = json.loads(attr_map)
-            except json.JSONDecodeError:
-                return Response({"error": "AUTH_LDAP_USER_ATTR_MAP not valid"}, status=401)
-
-            server = Server(host, use_ssl=use_ssl)
-            conn = Connection(server, bind_dn, password)
-            try:
-                conn.bind()
-            except Exception as e:
-                return Response({"error": str(e)}, status=401)
-
-            ok = conn.search(search_ou, search_filter % ({"user": "*"}),
-                             attributes=list(attr_map.values()))
-            if not ok:
-                return Response({"error": "Search no entry matched"}, status=401)
-
-            users = []
-            for entry in conn.entries:
-                user = {}
-                for attr, mapping in attr_map.items():
-                    if hasattr(entry, mapping):
-                        user[attr] = getattr(entry, mapping)
-                users.append(user)
-            if len(users) > 0:
-                return Response({"msg": _("Match {} s users").format(len(users))})
-            else:
-                return Response({"error": "Have user but attr mapping error"}, status=401)
-        else:
-            return Response({"error": str(serializer.errors)}, status=401)
+class OutputSerializer(serializers.Serializer):
+    output = serializers.CharField()
+    is_end = serializers.BooleanField()
+    mark = serializers.CharField()
 
 
-class DjangoSettingsAPI(APIView):
-    def get(self, request):
-        return Response('Danger, Close now')
+class LogTailApi(generics.RetrieveAPIView):
+    permission_classes = (IsValidUser,)
+    buff_size = 1024 * 10
+    serializer_class = OutputSerializer
+    end = False
+    mark = ''
+    log_path = ''
+
+    def is_file_finish_write(self):
+        return True
+
+    def get_log_path(self):
+        raise NotImplementedError()
+
+    def get_no_file_message(self, request):
+        return 'Not found the log'
+
+    def filter_line(self, line):
+        """
+        过滤行，可能替换一些信息
+        :param line:
+        :return:
+        """
+        return line
+
+    def read_from_file(self):
+        with open(self.log_path, 'rt', encoding='utf8') as f:
+            offset = cache.get(self.mark, 0)
+            f.seek(offset)
+            data = f.read(self.buff_size).replace('\n', '\r\n')
+
+            new_mark = str(uuid.uuid4())
+            cache.set(new_mark, f.tell(), 5)
+
+            if data == '' and self.is_file_finish_write():
+                self.end = True
+            _data = ''
+            for line in data.split('\r\n'):
+                new_line = self.filter_line(line)
+                if line == '':
+                    continue
+                _data += new_line + '\r\n'
+            return _data, self.end, new_mark
+
+    def get(self, request, *args, **kwargs):
+        self.mark = request.query_params.get("mark") or str(uuid.uuid4())
+        self.log_path = self.get_log_path()
+
+        if not self.log_path or not os.path.isfile(self.log_path):
+            msg = self.get_no_file_message(self.request)
+            return Response({"data": msg}, status=200)
+
+        data, end, new_mark = self.read_from_file()
+        return Response({"data": data, 'end': end, 'mark': new_mark})
 
 
+class ResourcesIDCacheApi(APIView):
+    permission_classes = (IsValidUser,)
 
+    def post(self, request, *args, **kwargs):
+        spm = str(uuid.uuid4())
+        resources = request.data.get('resources')
+        if resources is not None:
+            cache_key = KEY_CACHE_RESOURCE_IDS.format(spm)
+            cache.set(cache_key, resources, 300)
+        return Response({'spm': spm})
+
+
+@csrf_exempt
+def redirect_plural_name_api(request, *args, **kwargs):
+    resource = kwargs.get("resource", "")
+    org_full_path = request.get_full_path()
+    full_path = org_full_path.replace(resource, resource+"s", 1)
+    logger.debug("Redirect {} => {}".format(org_full_path, full_path))
+    return HttpResponseTemporaryRedirect(full_path)
+
+
+class CommonGenericViewSet(CommonApiMixin, GenericViewSet):
+    pass
