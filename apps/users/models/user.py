@@ -23,7 +23,7 @@ from orgs.models import OrganizationMember, Organization
 from common.utils import date_expired_default, get_logger, lazyproperty, random_string
 from common import fields
 from common.const import choices
-from common.db.models import ChoiceSet
+from common.db.models import TextChoices
 from users.exceptions import MFANotEnabled
 from ..signals import post_user_change_password
 
@@ -170,7 +170,7 @@ class AuthMixin:
 
 
 class RoleMixin:
-    class ROLE(ChoiceSet):
+    class ROLE(TextChoices):
         ADMIN = choices.ADMIN, _('System administrator')
         AUDITOR = choices.AUDITOR, _('System auditor')
         USER = choices.USER, _('User')
@@ -197,7 +197,8 @@ class RoleMixin:
         else:
             # 是真实组织, 取 OrganizationMember 中的角色
             roles = [
-                org_member.role for org_member in self.m2m_org_members.all()
+                getattr(ORG_ROLE, org_member.role.upper())
+                for org_member in self.m2m_org_members.all()
                 if org_member.org_id == current_org.id
             ]
             roles.sort()
@@ -206,7 +207,7 @@ class RoleMixin:
     @lazyproperty
     def org_roles_label_list(self):
         from orgs.models import ROLE as ORG_ROLE
-        return [str(ORG_ROLE[role]) for role in self.org_roles if role in ORG_ROLE]
+        return [str(role.label) for role in self.org_roles if role in ORG_ROLE]
 
     @lazyproperty
     def org_role_display(self):
